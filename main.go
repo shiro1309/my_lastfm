@@ -20,10 +20,12 @@ import (
 // --- GLOBALS ---
 
 var (
-	db          *sql.DB
-	dbMu        sync.Mutex
-	deezerCache = make(map[string][]DeezerTrack)
-	cacheMu     sync.Mutex
+	db                 *sql.DB
+	dbMu               sync.Mutex
+	deezerCache        = make(map[string][]DeezerTrack)
+	cacheMu            sync.Mutex
+	deezerTrackCache   = make(map[string][]DeezerTrack)
+	deezerPictureCache = make(map[string]string)
 )
 
 // --- MAIN ---
@@ -235,33 +237,35 @@ func executeLivePipeline(artist, track string) (int, string) {
 	core := stripParens(track)
 	key := strings.ToLower(strings.TrimSpace(artist))
 
-	// 1. Last.fm is authority for duration
+	// 1. Last.fm for duration
 	dur := lastfmDuration(artist, core)
 
-	// 2. Deezer for artwork (and duration fallback)
+	// 2. Deezer artist picture (dedicated artist search, cached separately)
 	cacheMu.Lock()
-	tracks, ok := deezerCache[key]
-	if !ok {
+	pic, picOk := deezerPictureCache[key]
+	if !picOk {
+		pic = deezerArtistPicture(artist)
+		deezerPictureCache[key] = pic
+	}
+
+	// 3. Deezer track search for duration fallback (cached separately)
+	tracks, trackOk := deezerTrackCache[key]
+	if !trackOk {
 		tracks = deezerSearch(fmt.Sprintf(`artist:"%s"`, artist))
-		deezerCache[key] = tracks
+		deezerTrackCache[key] = tracks
 	}
 	cacheMu.Unlock()
-
-	pic := ""
-	if len(tracks) > 0 {
-		pic = tracks[0].Artist.PictureXL
-	}
 
 	if dur > 0 {
 		return dur, pic
 	}
 
-	// 3. Local DB fallback for duration
+	// 4. Local DB fallback for duration
 	if dur = localDuration(artist, track); dur > 0 {
 		return dur, pic
 	}
 
-	// 4. Try matching Deezer track for duration
+	// 5. Match Deezer track for duration
 	coreLower := strings.ToLower(core)
 	for _, t := range tracks {
 		if strings.Contains(strings.ToLower(t.Title), coreLower) {
@@ -269,15 +273,15 @@ func executeLivePipeline(artist, track string) (int, string) {
 		}
 	}
 
-	// 5. Direct Deezer search
+	// 6. Direct Deezer track search as last resort
 	if dt := deezerSearch(artist + " " + core); len(dt) > 0 {
-		return dt[0].Duration, dt[0].Artist.PictureXL
+		return dt[0].Duration, pic
 	}
 
-	// 6. Try English portion from parentheses
+	// 7. Try English portion from parentheses
 	if eng := parensText(track); eng != "" {
 		if dt := deezerSearch(artist + " " + eng); len(dt) > 0 {
-			return dt[0].Duration, dt[0].Artist.PictureXL
+			return dt[0].Duration, pic
 		}
 	}
 
@@ -335,6 +339,25 @@ func deezerSearch(q string) []DeezerTrack {
 	}
 	json.NewDecoder(resp.Body).Decode(&out)
 	return out.Data
+}
+
+func deezerArtistPicture(artist string) string {
+	resp, err := http.Get("https://api.deezer.com/search/artist?q=" + url.QueryEscape(artist) + "&limit=1")
+	if err != nil || resp.StatusCode != 200 {
+		return ""
+	}
+	defer resp.Body.Close()
+
+	var out struct {
+		Data []struct {
+			Name      string `json:"name"`
+			PictureXL string `json:"picture_xl"`
+		} `json:"data"`
+	}
+	if json.NewDecoder(resp.Body).Decode(&out) != nil || len(out.Data) == 0 {
+		return ""
+	}
+	return out.Data[0].PictureXL
 }
 
 func localDuration(artist, track string) int {
