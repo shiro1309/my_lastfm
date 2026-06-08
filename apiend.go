@@ -3,6 +3,7 @@ package main
 import (
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
@@ -90,7 +91,7 @@ func handleGlobalMetrics(w http.ResponseWriter, r *http.Request) {
 	var m APIGlobalMetrics
 	if err := db.QueryRow("SELECT total_scrobbles, total_duration_seconds FROM global_metrics WHERE id=1").
 		Scan(&m.TotalScrobbles, &m.TotalDurationSecs); err != nil {
-		jsonError(w, "db error", 500)
+		jsonError(w, "db error", 500, err)
 		return
 	}
 	m.TotalDurationHuman = formatDuration(m.TotalDurationSecs)
@@ -122,7 +123,7 @@ func handleDailyMetrics(w http.ResponseWriter, r *http.Request) {
 
 	rows, err := db.Query(query, args...)
 	if err != nil {
-		jsonError(w, "db error", 500)
+		jsonError(w, "db error", 500, err)
 		return
 	}
 	defer rows.Close()
@@ -148,7 +149,7 @@ func handleArtists(w http.ResponseWriter, r *http.Request) {
 		`SELECT rowid, name, COALESCE(picture_url,''), total_plays FROM artists ORDER BY `+orderBy+` LIMIT ?`,
 		limit)
 	if err != nil {
-		jsonError(w, "db error", 500)
+		jsonError(w, "db error", 500, err)
 		return
 	}
 	defer rows.Close()
@@ -175,12 +176,16 @@ func handleArtist(w http.ResponseWriter, r *http.Request) {
 	if err := db.QueryRow(
 		`SELECT rowid, name, COALESCE(picture_url,''), total_plays FROM artists WHERE name = ? COLLATE NOCASE`, name,
 	).Scan(&a.Rowid, &a.Name, &a.PictureURL, &a.TotalPlays); err != nil {
-		jsonError(w, "artist not found", 404)
+		jsonError(w, "artist not found", 404, err)
 		return
 	}
 
-	albumRows, _ := db.Query(
-		`SELECT rowid, artist_rowid, name, total_plays FROM albums WHERE artist_rowid = ? ORDER BY total_plays DESC`, a.Rowid)
+	albumRows, err := db.Query(
+		`SELECT rowid, artist_id, name, total_plays FROM albums WHERE artist_id = ? ORDER BY total_plays DESC`, a.Rowid)
+	if err != nil {
+		jsonError(w, "db error", 500, err)
+		return
+	}
 	defer albumRows.Close()
 	var albums []APIAlbum
 	for albumRows.Next() {
@@ -190,10 +195,14 @@ func handleArtist(w http.ResponseWriter, r *http.Request) {
 		albums = append(albums, al)
 	}
 
-	trackRows, _ := db.Query(
-		`SELECT t.rowid, t.artist_rowid, t.album_rowid, t.name, t.duration, COALESCE(al.name,'')
-		 FROM tracks t LEFT JOIN albums al ON al.rowid = t.album_rowid
-		 WHERE t.artist_rowid = ? ORDER BY t.name ASC`, a.Rowid)
+	trackRows, err := db.Query(
+		`SELECT t.rowid, t.artist_id, t.album_id, t.name, t.duration, COALESCE(al.name,'')
+		 FROM tracks t LEFT JOIN albums al ON al.rowid = t.album_id
+		 WHERE t.artist_id = ? ORDER BY t.name ASC`, a.Rowid)
+	if err != nil {
+		jsonError(w, "db error", 500, err)
+		return
+	}
 	defer trackRows.Close()
 	var tracks []APITrack
 	for trackRows.Next() {
@@ -211,8 +220,8 @@ func handleAlbums(w http.ResponseWriter, r *http.Request) {
 	limit := queryInt(q.Get("limit"), 50)
 	artist := q.Get("artist")
 
-	query := `SELECT al.rowid, al.artist_rowid, ar.name, al.name, al.total_plays
-		FROM albums al JOIN artists ar ON ar.rowid = al.artist_rowid`
+	query := `SELECT al.rowid, al.artist_id, ar.name, al.name, al.total_plays
+		FROM albums al JOIN artists ar ON ar.rowid = al.artist_id`
 	var args []any
 	if artist != "" {
 		query += " WHERE ar.name = ? COLLATE NOCASE"
@@ -223,7 +232,7 @@ func handleAlbums(w http.ResponseWriter, r *http.Request) {
 
 	rows, err := db.Query(query, args...)
 	if err != nil {
-		jsonError(w, "db error", 500)
+		jsonError(w, "db error", 500, err)
 		return
 	}
 	defer rows.Close()
@@ -242,10 +251,10 @@ func handleTracks(w http.ResponseWriter, r *http.Request) {
 	limit := queryInt(q.Get("limit"), 50)
 	artist := q.Get("artist")
 
-	query := `SELECT t.rowid, t.artist_rowid, ar.name, t.album_rowid, COALESCE(al.name,''), t.name, t.duration
+	query := `SELECT t.rowid, t.artist_id, ar.name, t.album_id, COALESCE(al.name,''), t.name, t.duration
 		FROM tracks t
-		JOIN artists ar ON ar.rowid = t.artist_rowid
-		LEFT JOIN albums al ON al.rowid = t.album_rowid`
+		JOIN artists ar ON ar.rowid = t.artist_id
+		LEFT JOIN albums al ON al.rowid = t.album_id`
 	var args []any
 	if artist != "" {
 		query += " WHERE ar.name = ? COLLATE NOCASE"
@@ -256,7 +265,7 @@ func handleTracks(w http.ResponseWriter, r *http.Request) {
 
 	rows, err := db.Query(query, args...)
 	if err != nil {
-		jsonError(w, "db error", 500)
+		jsonError(w, "db error", 500, err)
 		return
 	}
 	defer rows.Close()
@@ -280,22 +289,22 @@ func handleTopTracks(w http.ResponseWriter, r *http.Request) {
 		PlayCount int `json:"play_count"`
 	}
 
-	query := `SELECT t.rowid, t.artist_rowid, ar.name, t.album_rowid, COALESCE(al.name,''), t.name, t.duration, COUNT(s.rowid) as plays
+	query := `SELECT t.rowid, t.artist_id, ar.name, t.album_id, COALESCE(al.name,''), t.name, t.duration, COUNT(s.rowid) as plays
 		FROM scrobbles s
-		JOIN tracks t ON t.rowid = s.track_rowid
-		JOIN artists ar ON ar.rowid = t.artist_rowid
-		LEFT JOIN albums al ON al.rowid = t.album_rowid`
+		JOIN tracks t ON t.rowid = s.track_id
+		JOIN artists ar ON ar.rowid = t.artist_id
+		LEFT JOIN albums al ON al.rowid = t.album_id`
 	var args []any
 	if artist != "" {
 		query += " WHERE ar.name = ? COLLATE NOCASE"
 		args = append(args, artist)
 	}
-	query += " GROUP BY s.track_rowid ORDER BY plays DESC LIMIT ?"
+	query += " GROUP BY s.track_id ORDER BY plays DESC LIMIT ?"
 	args = append(args, limit)
 
 	rows, err := db.Query(query, args...)
 	if err != nil {
-		jsonError(w, "db error", 500)
+		jsonError(w, "db error", 500, err)
 		return
 	}
 	defer rows.Close()
@@ -316,11 +325,11 @@ func handleScrobbles(w http.ResponseWriter, r *http.Request) {
 	before := q.Get("before")
 	after := q.Get("after")
 
-	query := `SELECT s.rowid, s.track_rowid, t.name, ar.name, COALESCE(al.name,''), t.duration, s.played_at
+	query := `SELECT s.rowid, s.track_id, t.name, ar.name, COALESCE(al.name,''), t.duration, s.played_at
 		FROM scrobbles s
-		JOIN tracks t ON t.rowid = s.track_rowid
-		JOIN artists ar ON ar.rowid = t.artist_rowid
-		LEFT JOIN albums al ON al.rowid = t.album_rowid`
+		JOIN tracks t ON t.rowid = s.track_id
+		JOIN artists ar ON ar.rowid = t.artist_id
+		LEFT JOIN albums al ON al.rowid = t.album_id`
 	var args []any
 	var clauses []string
 
@@ -344,7 +353,7 @@ func handleScrobbles(w http.ResponseWriter, r *http.Request) {
 
 	rows, err := db.Query(query, args...)
 	if err != nil {
-		jsonError(w, "db error", 500)
+		jsonError(w, "db error", 500, err)
 		return
 	}
 	defer rows.Close()
@@ -354,14 +363,14 @@ func handleScrobbles(w http.ResponseWriter, r *http.Request) {
 func handleRecentScrobbles(w http.ResponseWriter, r *http.Request) {
 	limit := queryInt(r.URL.Query().Get("limit"), 20)
 	rows, err := db.Query(
-		`SELECT s.rowid, s.track_rowid, t.name, ar.name, COALESCE(al.name,''), t.duration, s.played_at
+		`SELECT s.rowid, s.track_id, t.name, ar.name, COALESCE(al.name,''), t.duration, s.played_at
 		 FROM scrobbles s
-		 JOIN tracks t ON t.rowid = s.track_rowid
-		 JOIN artists ar ON ar.rowid = t.artist_rowid
-		 LEFT JOIN albums al ON al.rowid = t.album_rowid
+		 JOIN tracks t ON t.rowid = s.track_id
+		 JOIN artists ar ON ar.rowid = t.artist_id
+		 LEFT JOIN albums al ON al.rowid = t.album_id
 		 ORDER BY s.played_at DESC LIMIT ?`, limit)
 	if err != nil {
-		jsonError(w, "db error", 500)
+		jsonError(w, "db error", 500, err)
 		return
 	}
 	defer rows.Close()
@@ -403,7 +412,10 @@ func jsonOK(w http.ResponseWriter, v any) {
 	json.NewEncoder(w).Encode(v)
 }
 
-func jsonError(w http.ResponseWriter, msg string, code int) {
+func jsonError(w http.ResponseWriter, msg string, code int, err error) {
+	if err != nil {
+		fmt.Printf("[API ERROR] %s: %v\n", msg, err)
+	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
 	json.NewEncoder(w).Encode(APIError{msg})
