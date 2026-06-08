@@ -34,21 +34,41 @@ func initDB() (bool, error) {
 		return false, fmt.Errorf("open: %w", err)
 	}
 
+	// Close db if any subsequent initialisation step fails.
+	success := false
+	defer func() {
+		if !success {
+			db.Close()
+			db = nil
+		}
+	}()
+
+	db.SetMaxOpenConns(1)
+
 	if err = db.Ping(); err != nil {
 		return false, fmt.Errorf("connect: %w", err)
 	}
 
-	db.SetMaxOpenConns(1)
+	// WAL mode returns the active mode name; verify it actually switched.
+	var walMode string
+	if err = db.QueryRow(`PRAGMA journal_mode=WAL`).Scan(&walMode); err != nil {
+		return false, fmt.Errorf("pragma journal_mode: %w", err)
+	}
+	if walMode != "wal" {
+		return false, fmt.Errorf("pragma journal_mode: expected wal, got %q (network filesystem?)", walMode)
+	}
 
-	pragmas := []string{
-		`PRAGMA journal_mode=WAL`,
-		`PRAGMA synchronous=NORMAL`,
-		`PRAGMA foreign_keys=ON`,
+	pragmas := []struct {
+		label string
+		sql   string
+	}{
+		{"synchronous", `PRAGMA synchronous=NORMAL`},
+		{"foreign_keys", `PRAGMA foreign_keys=ON`},
 	}
 
 	for _, p := range pragmas {
-		if _, err = db.Exec(p); err != nil {
-			return false, fmt.Errorf("pragma %q: %w", p, err)
+		if _, err = db.Exec(p.sql); err != nil {
+			return false, fmt.Errorf("pragma %s: %w", p.label, err)
 		}
 	}
 
@@ -102,11 +122,11 @@ func initDB() (bool, error) {
 	}
 
 	var count int
-	err = db.QueryRow("SELECT COUNT(*) FROM scrobbles").Scan(&count)
-	if err != nil {
+	if err = db.QueryRow("SELECT COUNT(*) FROM scrobbles").Scan(&count); err != nil {
 		return false, fmt.Errorf("checking existing data: %w", err)
 	}
 
-	isNew := count == 0
-	return isNew, nil
+	success = true
+
+	return count == 0, nil
 }
