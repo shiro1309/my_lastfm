@@ -29,7 +29,11 @@ func initEnv() {
 
 func initDB() (bool, error) {
 	var err error
-	db, err = sql.Open("sqlite", "stats.db")
+	dbPath := os.Getenv("DB_PATH")
+	if dbPath == "" {
+		dbPath = "data/stats.db"
+	}
+	db, err = sql.Open("sqlite", dbPath)
 	if err != nil {
 		return false, fmt.Errorf("open: %w", err)
 	}
