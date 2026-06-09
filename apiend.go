@@ -121,7 +121,12 @@ func handleDailyMetrics(w http.ResponseWriter, r *http.Request) {
 	if len(clauses) > 0 {
 		query += " WHERE " + strings.Join(clauses, " AND ")
 	}
-	query += " ORDER BY date DESC LIMIT ?"
+
+	order := "DESC"
+	if q.Get("order") == "asc" {
+		order = "ASC"
+	}
+	query += " ORDER BY date " + order + " LIMIT ?"
 	args = append(args, limit)
 
 	rows, err := db.Query(query, args...)
