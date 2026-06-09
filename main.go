@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -22,10 +23,10 @@ import (
 var (
 	db                 *sql.DB
 	dbMu               sync.Mutex
-	deezerCache        = make(map[string][]DeezerTrack)
 	cacheMu            sync.Mutex
 	deezerTrackCache   = make(map[string][]DeezerTrack)
 	deezerPictureCache = make(map[string]string)
+	deezerAlbumCache   = make(map[string]string)
 )
 
 // --- MAIN ---
@@ -83,6 +84,167 @@ func main() {
 	for range time.NewTicker(4 * time.Minute).C {
 		runIncrementalSync(user, apiKey)
 	}
+}
+
+// --- Visual ---
+func logoOutRebel() {
+	fmt.Println(`
+	 ██████   ██████                      ████                     █████       ██████                 
+	▒▒██████ ██████                      ▒▒███                    ▒▒███       ███▒▒███                
+	 ▒███▒█████▒███  █████ ████           ▒███   ██████    █████  ███████    ▒███ ▒▒▒  █████████████  
+	 ▒███▒▒███ ▒███ ▒▒███ ▒███            ▒███  ▒▒▒▒▒███  ███▒▒  ▒▒▒███▒    ███████   ▒▒███▒▒███▒▒███ 
+	 ▒███ ▒▒▒  ▒███  ▒███ ▒███            ▒███   ███████ ▒▒█████   ▒███    ▒▒▒███▒     ▒███ ▒███ ▒███ 
+	 ▒███      ▒███  ▒███ ▒███            ▒███  ███▒▒███  ▒▒▒▒███  ▒███ ███  ▒███      ▒███ ▒███ ▒███ 
+	 █████     █████ ▒▒███████  █████████ █████▒▒████████ ██████   ▒▒█████   █████     █████▒███ █████
+	▒▒▒▒▒     ▒▒▒▒▒   ▒▒▒▒▒███ ▒▒▒▒▒▒▒▒▒ ▒▒▒▒▒  ▒▒▒▒▒▒▒▒ ▒▒▒▒▒▒     ▒▒▒▒▒   ▒▒▒▒▒     ▒▒▒▒▒ ▒▒▒ ▒▒▒▒▒ 
+	                  ███ ▒███                                                         Version: 0.0.1
+	                 ▒▒██████                                                                         
+	                  ▒▒▒▒▒▒                                                                          
+	`)
+}
+
+func logoOut() {
+	fmt.Println(`
+	███╗   ███╗██╗   ██╗     ██╗      █████╗ ███████╗████████╗███████╗███╗   ███╗
+	████╗ ████║╚██╗ ██╔╝     ██║     ██╔══██╗██╔════╝╚══██╔══╝██╔════╝████╗ ████║
+	██╔████╔██║ ╚████╔╝      ██║     ███████║███████╗   ██║   █████╗  ██╔████╔██║
+	██║╚██╔╝██║  ╚██╔╝       ██║     ██╔══██║╚════██║   ██║   ██╔══╝  ██║╚██╔╝██║
+	██║ ╚═╝ ██║   ██║███████╗███████╗██║  ██║███████║   ██║   ██║     ██║ ╚═╝ ██║
+	╚═╝     ╚═╝   ╚═╝╚══════╝╚══════╝╚═╝  ╚═╝╚══════╝   ╚═╝   ╚═╝     ╚═╝     ╚═╝
+	                                                               Version: 0.0.1			
+	`)
+}
+
+// --- INIT ---
+
+func initEnv() {
+	f, err := os.Open(".env")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[ERROR] Failed to open env: %v\n", err)
+		return
+	}
+	defer f.Close()
+	s := bufio.NewScanner(f)
+	for s.Scan() {
+		line := strings.TrimSpace(s.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		if k, v, ok := strings.Cut(line, "="); ok {
+			os.Setenv(strings.TrimSpace(k), strings.Trim(strings.TrimSpace(v), `"'`))
+		}
+	}
+}
+
+func initDB() (bool, error) {
+	var err error
+	dbPath := os.Getenv("DB_PATH")
+	if dbPath == "" {
+		dbPath = "data/stats.db"
+	}
+	fmt.Printf("opening DB at: %s\n", dbPath)
+	db, err = sql.Open("sqlite", dbPath)
+	if err != nil {
+		return false, fmt.Errorf("open: %w", err)
+	}
+
+	// Close db if any subsequent initialisation step fails.
+	success := false
+	defer func() {
+		if !success {
+			db.Close()
+			db = nil
+		}
+	}()
+
+	db.SetMaxOpenConns(1)
+
+	if err = db.Ping(); err != nil {
+		return false, fmt.Errorf("connect: %w", err)
+	}
+
+	// WAL mode returns the active mode name; verify it actually switched.
+	var walMode string
+	if err = db.QueryRow(`PRAGMA journal_mode=WAL`).Scan(&walMode); err != nil {
+		return false, fmt.Errorf("pragma journal_mode: %w", err)
+	}
+	if walMode != "wal" {
+		return false, fmt.Errorf("pragma journal_mode: expected wal, got %q (network filesystem?)", walMode)
+	}
+
+	pragmas := []struct {
+		label string
+		sql   string
+	}{
+		{"synchronous", `PRAGMA synchronous=NORMAL`},
+		{"foreign_keys", `PRAGMA foreign_keys=ON`},
+	}
+
+	for _, p := range pragmas {
+		if _, err = db.Exec(p.sql); err != nil {
+			return false, fmt.Errorf("pragma %s: %w", p.label, err)
+		}
+	}
+
+	stmts := []string{
+		`CREATE TABLE IF NOT EXISTS artists (
+			id          INTEGER PRIMARY KEY AUTOINCREMENT,
+			name        TEXT NOT NULL UNIQUE COLLATE NOCASE,
+			picture_url TEXT DEFAULT '',
+			total_plays INTEGER DEFAULT 0
+		)`,
+		`CREATE TABLE IF NOT EXISTS albums (
+			id          INTEGER PRIMARY KEY AUTOINCREMENT,
+			artist_id   INTEGER NOT NULL REFERENCES artists(id),
+			name        TEXT NOT NULL COLLATE NOCASE,
+			cover_url   TEXT DEFAULT '',
+			total_plays INTEGER DEFAULT 0,
+			UNIQUE(artist_id, name)
+		)`,
+		`CREATE TABLE IF NOT EXISTS tracks (
+		    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+		    artist_id INTEGER NOT NULL REFERENCES artists(id),
+		    album_id  INTEGER REFERENCES albums(id),
+		    name      TEXT NOT NULL COLLATE NOCASE,
+		    duration  INTEGER DEFAULT 0,
+		    cover_url TEXT DEFAULT '',
+		    UNIQUE(artist_id, name)
+		)`,
+		`CREATE TABLE IF NOT EXISTS scrobbles (
+			id        INTEGER PRIMARY KEY AUTOINCREMENT,
+			track_id  INTEGER NOT NULL REFERENCES tracks(id),
+			played_at INTEGER NOT NULL,
+			UNIQUE(track_id, played_at)
+		)`,
+		`CREATE TABLE IF NOT EXISTS global_metrics (
+			id                     INTEGER PRIMARY KEY CHECK(id=1),
+			total_scrobbles        INTEGER DEFAULT 0,
+			total_duration_seconds INTEGER DEFAULT 0
+		)`,
+		`CREATE TABLE IF NOT EXISTS daily_metrics (
+			date           TEXT PRIMARY KEY,
+			scrobble_count INTEGER DEFAULT 0
+		)`,
+		`INSERT OR IGNORE INTO global_metrics VALUES (1, 0, 0)`,
+		`CREATE INDEX IF NOT EXISTS idx_scrobbles_played_at ON scrobbles(played_at)`,
+		`CREATE INDEX IF NOT EXISTS idx_tracks_artist_id    ON tracks(artist_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_albums_artist_id    ON albums(artist_id)`,
+	}
+
+	for _, s := range stmts {
+		if _, err = db.Exec(s); err != nil {
+			return false, fmt.Errorf("schema: %w\nstatement: %s", err, s)
+		}
+	}
+
+	var count int
+	if err = db.QueryRow("SELECT COUNT(*) FROM scrobbles").Scan(&count); err != nil {
+		return false, fmt.Errorf("checking existing data: %w", err)
+	}
+
+	success = true
+
+	return count == 0, nil
 }
 
 // --- SYNC ---
@@ -211,8 +373,12 @@ func processBatch(tracks []LastFmTrack) (logged int, skipped int) {
 				album = "[Unknown Album]"
 			}
 
-			dur, pic := executeLivePipeline(t.Artist.Text, t.Name)
-			results[i] = &trackResult{t, uts, album, dur, pic}
+			dur, pic, cover, trackCover := executeLivePipeline(t.Artist.Text, t.Name, album)
+
+			if trackCover != "" {
+				album = ""
+			}
+			results[i] = &trackResult{t, uts, album, dur, pic, cover, trackCover}
 		}()
 	}
 	wg.Wait()
@@ -222,7 +388,7 @@ func processBatch(tracks []LastFmTrack) (logged int, skipped int) {
 		if r == nil {
 			continue
 		}
-		if commitScrobble(r.track.Artist.Text, r.album, r.track.Name, r.dur, r.pic, r.uts) {
+		if commitScrobble(r.track.Artist.Text, r.album, r.track.Name, r.dur, r.pic, r.cover, r.trackCover, r.uts) {
 			logged++
 		} else {
 			skipped++
@@ -233,22 +399,23 @@ func processBatch(tracks []LastFmTrack) (logged int, skipped int) {
 
 // --- METADATA PIPELINE ---
 
-func executeLivePipeline(artist, track string) (int, string) {
+func executeLivePipeline(artist, track, album string) (dur int, pic, cover, trackCover string) {
 	core := stripParens(track)
 	key := strings.ToLower(strings.TrimSpace(artist))
+	albumKey := key + "|" + strings.ToLower(strings.TrimSpace(album))
 
-	// 1. Last.fm for duration
-	dur := lastfmDuration(artist, core)
+	// 1. Last.fm duration
+	dur = lastfmDuration(artist, core)
 
-	// 2. Deezer artist picture (dedicated artist search, cached separately)
 	cacheMu.Lock()
+	// 2. Artist picture
 	pic, picOk := deezerPictureCache[key]
 	if !picOk {
 		pic = deezerArtistPicture(artist)
 		deezerPictureCache[key] = pic
 	}
 
-	// 3. Deezer track search for duration fallback (cached separately)
+	// 3. Track search for duration fallback + cover
 	tracks, trackOk := deezerTrackCache[key]
 	if !trackOk {
 		tracks = deezerSearch(fmt.Sprintf(`artist:"%s"`, artist))
@@ -256,36 +423,65 @@ func executeLivePipeline(artist, track string) (int, string) {
 	}
 	cacheMu.Unlock()
 
-	if dur > 0 {
-		return dur, pic
-	}
-
-	// 4. Local DB fallback for duration
-	if dur = localDuration(artist, track); dur > 0 {
-		return dur, pic
-	}
-
-	// 5. Match Deezer track for duration
+	// 4. Find matching Deezer track for cover logic
 	coreLower := strings.ToLower(core)
-	for _, t := range tracks {
+	var matchedTrack *DeezerTrack
+	for i, t := range tracks {
 		if strings.Contains(strings.ToLower(t.Title), coreLower) {
-			return t.Duration, pic
+			matchedTrack = &tracks[i]
+			if dur == 0 {
+				dur = t.Duration
+			}
+			break
 		}
 	}
 
-	// 6. Direct Deezer track search as last resort
-	if dt := deezerSearch(artist + " " + core); len(dt) > 0 {
-		return dt[0].Duration, pic
-	}
-
-	// 7. Try English portion from parentheses
-	if eng := parensText(track); eng != "" {
-		if dt := deezerSearch(artist + " " + eng); len(dt) > 0 {
-			return dt[0].Duration, pic
+	// fallback duration from direct search
+	if dur == 0 {
+		if dt := deezerSearch(artist + " " + core); len(dt) > 0 {
+			matchedTrack = &dt[0]
+			dur = dt[0].Duration
 		}
 	}
+	if dur == 0 {
+		if eng := parensText(track); eng != "" {
+			if dt := deezerSearch(artist + " " + eng); len(dt) > 0 {
+				matchedTrack = &dt[0]
+				dur = dt[0].Duration
+			}
+		}
+	}
+	if dur == 0 {
+		dur = localDuration(artist, track)
+	}
 
-	return 0, pic
+	// 5. Determine cover — check if it's a real album or a single
+	cacheMu.Lock()
+	cover, coverOk := deezerAlbumCache[albumKey]
+	if !coverOk {
+		if album != "" && album != "[Unknown Album]" {
+			var isReal bool
+			cover, isReal = deezerAlbumCover(artist, album)
+			if !isReal && cover != "" {
+				// it's a single masquerading as an album
+				trackCover = cover
+				cover = ""
+			}
+		}
+		// if no cover from dedicated search, check track match
+		if cover == "" && trackCover == "" && matchedTrack != nil && matchedTrack.Album.ID != 0 {
+			nbTracks := deezerAlbumTrackCount(matchedTrack.Album.ID)
+			if nbTracks >= 3 {
+				cover = matchedTrack.Album.CoverXL
+			} else {
+				trackCover = matchedTrack.Album.CoverXL
+			}
+		}
+		deezerAlbumCache[albumKey] = cover
+	}
+	cacheMu.Unlock()
+
+	return dur, pic, cover, trackCover
 }
 
 // --- API HELPERS ---
@@ -360,18 +556,65 @@ func deezerArtistPicture(artist string) string {
 	return out.Data[0].PictureXL
 }
 
+func deezerAlbumCover(artist, album string) (cover string, isReal bool) {
+	resp, err := http.Get("https://api.deezer.com/search/album?q=" + url.QueryEscape(fmt.Sprintf(`artist:"%s" album:"%s"`, artist, album)) + "&limit=1")
+	if err != nil || resp.StatusCode != 200 {
+		return "", false
+	}
+	defer resp.Body.Close()
+
+	var out struct {
+		Data []struct {
+			ID      int    `json:"id"`
+			Title   string `json:"title"`
+			CoverXL string `json:"cover_xl"`
+		} `json:"data"`
+	}
+	if json.NewDecoder(resp.Body).Decode(&out) != nil || len(out.Data) == 0 {
+		return "", false
+	}
+
+	nbTracks := deezerAlbumTrackCount(out.Data[0].ID)
+	fmt.Printf("[deezerAlbumCover] %q nb_tracks=%d\n", out.Data[0].Title, nbTracks)
+	return out.Data[0].CoverXL, nbTracks >= 3
+}
+
+func deezerAlbumTrackCount(albumID int) int {
+	if albumID == 0 {
+		return 0
+	}
+	resp, err := http.Get(fmt.Sprintf("https://api.deezer.com/album/%d", albumID))
+	if err != nil || resp.StatusCode != 200 {
+		return 0
+	}
+	defer resp.Body.Close()
+
+	var out struct {
+		NbTracks int `json:"nb_tracks"`
+	}
+	if json.NewDecoder(resp.Body).Decode(&out) != nil {
+		return 0
+	}
+	return out.NbTracks
+}
+
 func localDuration(artist, track string) int {
 	if db == nil {
 		return 0
 	}
 	var dur int
-	db.QueryRow(`SELECT track_duration FROM scrobbles WHERE artist_name=? COLLATE NOCASE AND track=? COLLATE NOCASE AND track_duration>0 ORDER BY played_at DESC LIMIT 1`,
-		artist, track).Scan(&dur)
+	db.QueryRow(`
+		SELECT t.duration FROM tracks t
+		JOIN artists ar ON ar.id = t.artist_id
+		WHERE ar.name = ? COLLATE NOCASE
+		AND t.name = ? COLLATE NOCASE
+		AND t.duration > 0
+		LIMIT 1`, artist, track).Scan(&dur)
 	return dur
 }
 
 // --- DB WRITER ---
-func commitScrobble(artist, album, track string, dur int, pic string, ts int64) bool {
+func commitScrobble(artist, album, track string, dur int, pic, cover, trackCover string, ts int64) bool {
 	if db == nil {
 		return false
 	}
@@ -398,27 +641,37 @@ func commitScrobble(artist, album, track string, dur int, pic string, ts int64) 
 		return false
 	}
 
-	// 2. Upsert album, get id
-	if _, err := db.Exec(`
-		INSERT INTO albums (artist_id, name, total_plays) VALUES (?, ?, 0)
-		ON CONFLICT(artist_id, name) DO NOTHING`,
-		artistID, al); err != nil {
-		fmt.Printf("commitScrobble: album insert failed for %q/%q: %v\n", a, al, err)
-		return false
-	}
-	var albumID int64
-	if err := db.QueryRow(`SELECT rowid FROM albums WHERE artist_id = ? AND name = ?`, artistID, al).Scan(&albumID); err != nil {
-		fmt.Printf("commitScrobble: album lookup failed for %q/%q: %v\n", a, al, err)
-		return false
+	// 2. Upsert album, get id (skipped for singles with no album)
+	var albumID sql.NullInt64
+
+	if al != "" {
+		if _, err := db.Exec(`
+	        INSERT INTO albums (artist_id, name, total_plays, cover_url) VALUES (?, ?, 0, ?)
+	        ON CONFLICT(artist_id, name) DO UPDATE SET
+	        cover_url = CASE WHEN ? != '' THEN ? ELSE cover_url END`,
+			artistID, al, cover, cover, cover); err != nil {
+			fmt.Printf("commitScrobble: album insert failed for %q/%q: %v\n", a, al, err)
+			return false
+		}
+		var id int64
+		if err := db.QueryRow(`SELECT rowid FROM albums WHERE artist_id = ? AND name = ?`, artistID, al).Scan(&id); err != nil {
+			fmt.Printf("commitScrobble: album lookup failed for %q/%q: %v\n", a, al, err)
+			return false
+		}
+		albumID = sql.NullInt64{Int64: id, Valid: true}
 	}
 
 	// 3. Upsert track, get id
 	if _, err := db.Exec(`
-		INSERT INTO tracks (artist_id, album_id, name, duration) VALUES (?, ?, ?, ?)
-		ON CONFLICT(artist_id, name) DO UPDATE SET
-		duration = CASE WHEN ? > 0 AND duration = 0 THEN ? ELSE duration END,
-		album_id = CASE WHEN album_id IS NULL THEN ? ELSE album_id END`,
-		artistID, albumID, tr, dur, dur, dur, albumID); err != nil {
+    	INSERT INTO tracks (artist_id, album_id, name, duration, cover_url) VALUES (?, ?, ?, ?, ?)
+    	ON CONFLICT(artist_id, name) DO UPDATE SET
+    	duration  = CASE WHEN ? > 0 AND duration = 0 THEN ? ELSE duration END,
+    	album_id  = CASE WHEN album_id IS NULL AND ? IS NOT NULL THEN ? ELSE album_id END,
+    	cover_url = CASE WHEN ? != '' THEN ? ELSE cover_url END`,
+		artistID, albumID, tr, dur, trackCover,
+		dur, dur,
+		albumID, albumID,
+		trackCover, trackCover); err != nil {
 		fmt.Printf("commitScrobble: track insert failed for %q/%q: %v\n", a, tr, err)
 		return false
 	}

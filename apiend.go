@@ -24,6 +24,7 @@ type APIAlbum struct {
 	ArtistRowid int64  `json:"artist_rowid"`
 	ArtistName  string `json:"artist_name"`
 	Name        string `json:"name"`
+	CoverURL    string `json:"cover_url"`
 	TotalPlays  int    `json:"total_plays"`
 }
 
@@ -35,6 +36,7 @@ type APITrack struct {
 	AlbumName   string `json:"album_name"`
 	Name        string `json:"name"`
 	Duration    int    `json:"duration_seconds"`
+	CoverURL    string `json:"cover_url"`
 }
 
 type APIScrobble struct {
@@ -46,6 +48,7 @@ type APIScrobble struct {
 	Duration      int    `json:"duration_seconds"`
 	PlayedAt      int64  `json:"played_at"`
 	PlayedAtHuman string `json:"played_at_human"`
+	CoverURL      string `json:"cover_url"`
 }
 
 type APIGlobalMetrics struct {
@@ -181,7 +184,7 @@ func handleArtist(w http.ResponseWriter, r *http.Request) {
 	}
 
 	albumRows, err := db.Query(
-		`SELECT rowid, artist_id, name, total_plays FROM albums WHERE artist_id = ? ORDER BY total_plays DESC`, a.Rowid)
+		`SELECT rowid, artist_id, name, COALESCE(cover_url,''), total_plays FROM albums WHERE artist_id = ? ORDER BY total_plays DESC`, a.Rowid)
 	if err != nil {
 		jsonError(w, "db error", 500, err)
 		return
@@ -191,7 +194,7 @@ func handleArtist(w http.ResponseWriter, r *http.Request) {
 	for albumRows.Next() {
 		var al APIAlbum
 		al.ArtistName = a.Name
-		albumRows.Scan(&al.Rowid, &al.ArtistRowid, &al.Name, &al.TotalPlays)
+		albumRows.Scan(&al.Rowid, &al.ArtistRowid, &al.Name, &al.CoverURL, &al.TotalPlays)
 		albums = append(albums, al)
 	}
 
@@ -220,8 +223,9 @@ func handleAlbums(w http.ResponseWriter, r *http.Request) {
 	limit := queryInt(q.Get("limit"), 50)
 	artist := q.Get("artist")
 
-	query := `SELECT al.rowid, al.artist_id, ar.name, al.name, al.total_plays
-		FROM albums al JOIN artists ar ON ar.rowid = al.artist_id`
+	query := `SELECT al.rowid, al.artist_id, ar.name, al.name, COALESCE(al.cover_url,''), al.total_plays
+    	FROM albums al JOIN artists ar ON ar.rowid = al.artist_id`
+
 	var args []any
 	if artist != "" {
 		query += " WHERE ar.name = ? COLLATE NOCASE"
@@ -240,7 +244,7 @@ func handleAlbums(w http.ResponseWriter, r *http.Request) {
 	var results []APIAlbum
 	for rows.Next() {
 		var al APIAlbum
-		rows.Scan(&al.Rowid, &al.ArtistRowid, &al.ArtistName, &al.Name, &al.TotalPlays)
+		rows.Scan(&al.Rowid, &al.ArtistRowid, &al.ArtistName, &al.Name, &al.CoverURL, &al.TotalPlays)
 		results = append(results, al)
 	}
 	jsonOK(w, results)
@@ -251,7 +255,7 @@ func handleTracks(w http.ResponseWriter, r *http.Request) {
 	limit := queryInt(q.Get("limit"), 50)
 	artist := q.Get("artist")
 
-	query := `SELECT t.rowid, t.artist_id, ar.name, t.album_id, COALESCE(al.name,''), t.name, t.duration
+	query := `SELECT t.rowid, t.artist_id, ar.name, t.album_id, COALESCE(al.name,''), t.name, t.duration, COALESCE(NULLIF(al.cover_url,''), t.cover_url, '')
 		FROM tracks t
 		JOIN artists ar ON ar.rowid = t.artist_id
 		LEFT JOIN albums al ON al.rowid = t.album_id`
@@ -273,7 +277,7 @@ func handleTracks(w http.ResponseWriter, r *http.Request) {
 	var results []APITrack
 	for rows.Next() {
 		var t APITrack
-		rows.Scan(&t.Rowid, &t.ArtistRowid, &t.ArtistName, &t.AlbumRowid, &t.AlbumName, &t.Name, &t.Duration)
+		rows.Scan(&t.Rowid, &t.ArtistRowid, &t.ArtistName, &t.AlbumRowid, &t.AlbumName, &t.Name, &t.Duration, &t.CoverURL)
 		results = append(results, t)
 	}
 	jsonOK(w, results)
@@ -289,7 +293,7 @@ func handleTopTracks(w http.ResponseWriter, r *http.Request) {
 		PlayCount int `json:"play_count"`
 	}
 
-	query := `SELECT t.rowid, t.artist_id, ar.name, t.album_id, COALESCE(al.name,''), t.name, t.duration, COUNT(s.rowid) as plays
+	query := `SELECT t.rowid, t.artist_id, ar.name, t.album_id, COALESCE(al.name,''), t.name, t.duration, COALESCE(NULLIF(al.cover_url,''), t.cover_url, ''), COUNT(s.rowid) as plays
 		FROM scrobbles s
 		JOIN tracks t ON t.rowid = s.track_id
 		JOIN artists ar ON ar.rowid = t.artist_id
@@ -312,7 +316,7 @@ func handleTopTracks(w http.ResponseWriter, r *http.Request) {
 	var results []TopTrack
 	for rows.Next() {
 		var t TopTrack
-		rows.Scan(&t.Rowid, &t.ArtistRowid, &t.ArtistName, &t.AlbumRowid, &t.AlbumName, &t.Name, &t.Duration, &t.PlayCount)
+		rows.Scan(&t.Rowid, &t.ArtistRowid, &t.ArtistName, &t.AlbumRowid, &t.AlbumName, &t.Name, &t.Duration, &t.CoverURL, &t.PlayCount)
 		results = append(results, t)
 	}
 	jsonOK(w, results)
@@ -325,7 +329,7 @@ func handleScrobbles(w http.ResponseWriter, r *http.Request) {
 	before := q.Get("before")
 	after := q.Get("after")
 
-	query := `SELECT s.rowid, s.track_id, t.name, ar.name, COALESCE(al.name,''), t.duration, s.played_at
+	query := `SELECT s.rowid, s.track_id, t.name, ar.name, COALESCE(al.name,''), t.duration, s.played_at, COALESCE(NULLIF(al.cover_url,''), t.cover_url, '')
 		FROM scrobbles s
 		JOIN tracks t ON t.rowid = s.track_id
 		JOIN artists ar ON ar.rowid = t.artist_id
@@ -363,7 +367,7 @@ func handleScrobbles(w http.ResponseWriter, r *http.Request) {
 func handleRecentScrobbles(w http.ResponseWriter, r *http.Request) {
 	limit := queryInt(r.URL.Query().Get("limit"), 20)
 	rows, err := db.Query(
-		`SELECT s.rowid, s.track_id, t.name, ar.name, COALESCE(al.name,''), t.duration, s.played_at
+		`SELECT s.rowid, s.track_id, t.name, ar.name, COALESCE(al.name,''), t.duration, s.played_at, COALESCE(NULLIF(al.cover_url,''), t.cover_url, '')
 		 FROM scrobbles s
 		 JOIN tracks t ON t.rowid = s.track_id
 		 JOIN artists ar ON ar.rowid = t.artist_id
@@ -377,13 +381,11 @@ func handleRecentScrobbles(w http.ResponseWriter, r *http.Request) {
 	jsonOK(w, scanScrobbles(rows))
 }
 
-// --- HELPERS ---
-
 func scanScrobbles(rows *sql.Rows) []APIScrobble {
 	var results []APIScrobble
 	for rows.Next() {
 		var s APIScrobble
-		rows.Scan(&s.Rowid, &s.TrackRowid, &s.TrackName, &s.ArtistName, &s.AlbumName, &s.Duration, &s.PlayedAt)
+		rows.Scan(&s.Rowid, &s.TrackRowid, &s.TrackName, &s.ArtistName, &s.AlbumName, &s.Duration, &s.PlayedAt, &s.CoverURL)
 		s.PlayedAtHuman = time.Unix(s.PlayedAt, 0).Format("2006-01-02 15:04:05")
 		results = append(results, s)
 	}
