@@ -1,0 +1,35 @@
+{
+  "$schema": "https://raw.githubusercontent.com/navidrome/navidrome/refs/heads/master/plugins/manifest-schema.json",
+  "name": "my_lastfm-plugin",
+  "author": "shiro1309",
+  "version": "0.1.0",
+  "description": "Posts completed scrobbles to your own API with full track metadata and duration",
+  "config": {
+    "schema": {
+      "type": "object",
+      "properties": {
+        "api_url": {
+          "type": "string",
+          "title": "API Endpoint URL",
+          "description": "e.g. http://yourserver:8080/api/scrobble",
+          "default": ""
+        },
+        "api_key": {
+          "type": "string",
+          "title": "API Key",
+          "description": "Bearer token (leave blank if no auth)",
+          "default": ""
+        }
+      }
+    }
+  },
+  "permissions": {
+    "users": {
+      "reason": "Receive scrobble events for assigned users"
+    },
+    "http": {
+      "reason": "POST scrobbles to your API",
+      "requiredHosts": ["*"]
+    }
+  }
+}
