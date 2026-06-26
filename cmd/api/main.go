@@ -323,6 +323,8 @@ func handleScrobble(w http.ResponseWriter, r *http.Request) {
 	}
 	defer r.Body.Close()
 
+	fmt.Printf("[DEBUG] payload: %+v\n", payload)
+
 	ok := commitScrobble(
 		payload.Artist,
 		payload.Album,
@@ -358,4 +360,16 @@ func jsonError(w http.ResponseWriter, msg string, code int, err error) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
 	json.NewEncoder(w).Encode(map[string]string{"error": msg})
+}
+
+type ScrobblePayload struct {
+	Title       string  `json:"title"`
+	Artist      string  `json:"artist"`
+	Album       string  `json:"album"`
+	Duration    float32 `json:"duration"`
+	TrackNumber int32   `json:"trackNumber"`
+	DiscNumber  int32   `json:"discNumber"`
+	Timestamp   int64   `json:"timestamp"`
+	NavidromeID string  `json:"navidromeId"`
+	MBID        string  `json:"mbid,omitempty"`
 }
