@@ -3,6 +3,7 @@ package main
 import (
 	"database/sql"
 	"fmt"
+	"os"
 
 	_ "modernc.org/sqlite"
 )
@@ -27,19 +28,27 @@ func runBackfill() (imported, skipped int) {
 		return
 	}
 
+	navUser := os.Getenv("NAVIDROME_USER")
+	if navUser == "" {
+		fmt.Println("backfill: NAVIDROME_USER not set")
+		return
+	}
+
 	rows, err := navidromeDB.Query(`
-		SELECT
-			id,
-			title,
-			artist,
-			COALESCE(album, ''),
-			CAST(duration AS INTEGER),
-			play_count,
-			COALESCE(mbz_recording_id, '')
-		FROM media_file
-		WHERE play_count > 0
-		ORDER BY artist, album, title
-	`)
+	    SELECT
+	        mf.id,
+	        mf.title,
+	        mf.artist,
+	        COALESCE(mf.album, ''),
+	        CAST(mf.duration AS INTEGER),
+	        COALESCE(mf.mbz_recording_id, ''),
+	        s.submission_time
+	    FROM scrobbles s
+	    JOIN media_file mf ON mf.id = s.media_file_id
+	    JOIN user u ON u.id = s.user_id
+	    WHERE u.user_name = ?
+	    ORDER BY s.submission_time ASC
+	`, navUser)
 	if err != nil {
 		fmt.Printf("backfill: query failed: %v\n", err)
 		return
@@ -53,16 +62,16 @@ func runBackfill() (imported, skipped int) {
 			artist      string
 			album       string
 			duration    int
-			playCount   int
 			mbid        string
+			playTime    int64
 		)
 
-		if err := rows.Scan(&navidromeID, &title, &artist, &album, &duration, &playCount, &mbid); err != nil {
+		if err := rows.Scan(&navidromeID, &title, &artist, &album, &duration, &mbid, &playTime); err != nil {
 			fmt.Printf("backfill: scan error: %v\n", err)
 			continue
 		}
 
-		if backfillTrack(navidromeID, title, artist, album, duration, playCount, mbid) {
+		if backfillTrack(navidromeID, title, artist, album, duration, mbid, playTime) {
 			imported++
 		} else {
 			skipped++
@@ -73,7 +82,7 @@ func runBackfill() (imported, skipped int) {
 	return
 }
 
-func backfillTrack(navidromeID, title, artist, album string, duration, playCount int, mbid string) bool {
+func backfillTrack(navidromeID, title, artist, album string, duration int, mbid string, playTime int64) bool {
 	coverArtID, navAlbumID, navArtistID := navidromeGetSong(navidromeID)
 	pic, picSource := fetchArtistImage(navArtistID, artist)
 
@@ -90,8 +99,17 @@ func backfillTrack(navidromeID, title, artist, album string, duration, playCount
 		return false
 	}
 
-	_, ok = upsertTrackWithCount(artistID, albumID, title, duration, playCount, trackCover, navidromeID, mbid)
-	return ok
+	trackID, ok := upsertTrack(artistID, albumID, title, duration, trackCover, navidromeID, mbid)
+	if !ok {
+		return false
+	}
+
+	if !insertScrobble(trackID, playTime, "backfill") {
+		return false
+	}
+
+	updateMetrics(artistID, albumID, duration, playTime)
+	return true
 }
 
 func upsertTrackWithCount(artistID int64, albumID sql.NullInt64, name string, dur, playCount int, trackCover, navidromeID, mbid string) (int64, bool) {
