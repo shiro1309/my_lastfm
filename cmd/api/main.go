@@ -94,6 +94,7 @@ func initDB() error {
 	for _, p := range []struct{ label, sql string }{
 		{"synchronous", `PRAGMA synchronous=NORMAL`},
 		{"foreign_keys", `PRAGMA foreign_keys=ON`},
+		{"wal_autocheckpoint", `PRAGMA wal_autocheckpoint=10`},
 	} {
 		if _, err = db.Exec(p.sql); err != nil {
 			return fmt.Errorf("pragma %s: %w", p.label, err)
@@ -218,7 +219,7 @@ func commitScrobble(artist, album, track string, dur int, pic, cover, trackCover
 		return false
 	}
 
-	albumID, ok := upsertAlbum(artistID, strings.TrimSpace(album), cover, navidromeID)
+	albumID, trackCover, ok := upsertAlbum(artistID, strings.TrimSpace(album), cover, navidromeID)
 	if !ok {
 		return false
 	}
@@ -253,40 +254,51 @@ func upsertArtist(name, pic string) (int64, bool) {
 	return id, true
 }
 
-func upsertAlbum(artistID int64, name, cover, trackNavidromeID string) (sql.NullInt64, bool) {
+func upsertAlbum(artistID int64, name, cover, trackNavidromeID string) (sql.NullInt64, string, bool) {
+	// returns albumID, trackCover, ok
+	// trackCover is non-empty when it's a single — caller sets it on the track instead
 	if name == "" {
-		return sql.NullInt64{}, true
+		return sql.NullInt64{}, "", true
 	}
 
-	// new album — fetch cover from Navidrome
-	navAlbumID := ""
 	var existingID int64
-	if err := db.QueryRow(`SELECT rowid FROM albums WHERE artist_id = ? AND name = ? COLLATE NOCASE`, artistID, name).Scan(&existingID); err == sql.ErrNoRows {
-		coverArtID, _ := navidromeGetCoverArt(trackNavidromeID)
-		if coverArtID != "" {
-			cover = navidromeCoverURL(coverArtID)
-			navAlbumID = coverArtID
-		}
-	}
+	err := db.QueryRow(`SELECT rowid FROM albums WHERE artist_id = ? AND name = ? COLLATE NOCASE`, artistID, name).Scan(&existingID)
 
-	if _, err := db.Exec(`
-		INSERT INTO albums (artist_id, navidrome_id, name, cover_url, total_plays) VALUES (?, ?, ?, ?, 0)
-		ON CONFLICT(artist_id, name) DO UPDATE SET
-		cover_url    = CASE WHEN ? != '' THEN ? ELSE cover_url END,
-		navidrome_id = CASE WHEN ? != '' THEN ? ELSE navidrome_id END`,
-		artistID, navAlbumID, name, cover,
-		cover, cover,
-		navAlbumID, navAlbumID); err != nil {
-		fmt.Printf("upsertAlbum: %q: %v\n", name, err)
-		return sql.NullInt64{}, false
+	if err == sql.ErrNoRows {
+		// new — fetch from Navidrome
+		coverArtID, navAlbumID := navidromeGetCoverArt(trackNavidromeID)
+		songCount, _ := navidromeGetAlbum(navAlbumID)
+
+		if songCount > 0 && songCount < 3 {
+			// it's a single — don't create album row, put cover on track
+			fmt.Printf("[upsertAlbum] %q has %d tracks — treating as single\n", name, songCount)
+			return sql.NullInt64{}, coverArtID, true
+		}
+
+		// real album — upsert it
+		if coverArtID != "" {
+			cover = coverArtID
+		}
+
+		if _, err := db.Exec(`
+			INSERT INTO albums (artist_id, navidrome_id, name, cover_url, total_plays) VALUES (?, ?, ?, ?, 0)
+			ON CONFLICT(artist_id, name) DO UPDATE SET
+			cover_url    = CASE WHEN ? != '' THEN ? ELSE cover_url END,
+			navidrome_id = CASE WHEN ? != '' THEN ? ELSE navidrome_id END`,
+			artistID, navAlbumID, name, cover,
+			cover, cover,
+			navAlbumID, navAlbumID); err != nil {
+			fmt.Printf("upsertAlbum: %q: %v\n", name, err)
+			return sql.NullInt64{}, "", false
+		}
 	}
 
 	var id int64
 	if err := db.QueryRow(`SELECT rowid FROM albums WHERE artist_id = ? AND name = ?`, artistID, name).Scan(&id); err != nil {
 		fmt.Printf("upsertAlbum lookup: %q: %v\n", name, err)
-		return sql.NullInt64{}, false
+		return sql.NullInt64{}, "", false
 	}
-	return sql.NullInt64{Int64: id, Valid: true}, true
+	return sql.NullInt64{Int64: id, Valid: true}, "", true
 }
 
 func upsertTrack(artistID int64, albumID sql.NullInt64, name string, dur int, trackCover, navidromeID, mbid string) (int64, bool) {
@@ -461,4 +473,43 @@ func navidromeCoverURL(coverArtID string) string {
 		url.QueryEscape(pass),
 		url.QueryEscape(coverArtID),
 	)
+}
+
+type NavidromeAlbumResponse struct {
+	SubsonicResponse struct {
+		Album struct {
+			SongCount int    `json:"songCount"`
+			CoverArt  string `json:"coverArt"`
+		} `json:"album"`
+	} `json:"subsonic-response"`
+}
+
+func navidromeGetAlbum(albumID string) (songCount int, coverArtID string) {
+	base := os.Getenv("NAVIDROME_URL")
+	user := os.Getenv("NAVIDROME_USER")
+	pass := os.Getenv("NAVIDROME_PASS")
+
+	if base == "" || albumID == "" {
+		return 0, ""
+	}
+
+	u := fmt.Sprintf("%s/rest/getAlbum?v=1.16.1&c=my_lastfm&f=json&u=%s&p=%s&id=%s",
+		base,
+		url.QueryEscape(user),
+		url.QueryEscape(pass),
+		url.QueryEscape(albumID),
+	)
+
+	resp, err := http.Get(u)
+	if err != nil || resp.StatusCode != 200 {
+		return 0, ""
+	}
+	defer resp.Body.Close()
+
+	var result NavidromeAlbumResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return 0, ""
+	}
+
+	return result.SubsonicResponse.Album.SongCount, result.SubsonicResponse.Album.CoverArt
 }
