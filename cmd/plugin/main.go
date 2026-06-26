@@ -3,22 +3,11 @@ package main
 import (
 	"encoding/json"
 	"fmt"
-	"strconv"
 
 	"fm-scraper/internal/schema"
 
 	pdk "github.com/extism/go-pdk"
-	"github.com/navidrome/navidrome/plugins/pdk/go/host"
 )
-
-// --- CONSTANTS ---
-
-const (
-	failedPrefix    = "failed:"
-	retryScheduleID = "retry-failed-scrobbles"
-)
-
-// --- INPUT TYPES (what Navidrome sends us) ---
 
 type TrackInfo struct {
 	ID             string  `json:"id"`
@@ -39,16 +28,6 @@ type ScrobbleRequest struct {
 	Track     TrackInfo `json:"track"`
 	Timestamp int64     `json:"timestamp"`
 }
-
-// --- LIFECYCLE ---
-
-//go:wasmexport nd_on_init
-func onInit() int32 {
-	host.SchedulerScheduleRecurring("@every 5m", "", retryScheduleID)
-	return 0
-}
-
-// --- SCROBBLER EXPORTS ---
 
 //go:wasmexport nd_scrobbler_is_authorized
 func isAuthorized() int32 {
@@ -86,38 +65,14 @@ func scrobble() int32 {
 		MBID:        req.Track.MbzRecordingID,
 	}
 
-	apiURL, apiKey := getConfig()
-	if apiURL == "" {
-		pdk.SetError(fmt.Errorf("scrobbler(not_authorized)"))
-		return 1
-	}
+	apiURL, _ := pdk.GetConfig("api_url")
+	apiKey, _ := pdk.GetConfig("api_key")
 
 	if err := sendPayload(payload, apiURL, apiKey); err != nil {
-		queueFailed(payload)
 		pdk.SetError(fmt.Errorf("scrobbler(retry_later)"))
 		return 1
 	}
 	return 0
-}
-
-// --- SCHEDULER CALLBACK ---
-
-//go:wasmexport nd_scheduler_callback
-func schedulerCallback() int32 {
-	apiURL, apiKey := getConfig()
-	if apiURL == "" {
-		return 0
-	}
-	retryFailed(apiURL, apiKey)
-	return 0
-}
-
-// --- HELPERS ---
-
-func getConfig() (apiURL, apiKey string) {
-	apiURL, _ = pdk.GetConfig("api_url")
-	apiKey, _ = pdk.GetConfig("api_key")
-	return
 }
 
 func sendPayload(payload schema.ScrobblePayload, apiURL, apiKey string) error {
@@ -138,33 +93,6 @@ func sendPayload(payload schema.ScrobblePayload, apiURL, apiKey string) error {
 		return fmt.Errorf("http %d", res.Status())
 	}
 	return nil
-}
-
-func queueFailed(payload schema.ScrobblePayload) {
-	body, _ := json.Marshal(payload)
-	key := failedPrefix + strconv.FormatInt(payload.Timestamp, 10)
-	host.KVStoreSet(key, body)
-}
-
-func retryFailed(apiURL, apiKey string) {
-	keys, err := host.KVStoreList(failedPrefix)
-	if err != nil || len(keys) == 0 {
-		return
-	}
-	for _, key := range keys {
-		value, exists, err := host.KVStoreGet(key)
-		if err != nil || !exists {
-			continue
-		}
-		var payload schema.ScrobblePayload
-		if err := json.Unmarshal(value, &payload); err != nil {
-			host.KVStoreDelete(key)
-			continue
-		}
-		if err := sendPayload(payload, apiURL, apiKey); err == nil {
-			host.KVStoreDelete(key)
-		}
-	}
 }
 
 func main() {}
