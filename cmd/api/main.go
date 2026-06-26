@@ -7,6 +7,7 @@ import (
 	"fm-scraper/internal/schema"
 	"fmt"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -200,21 +201,10 @@ func logoOutRebel() {
 }
 
 // --- DB ---
-func commitScrobble(
-	artist, album, track string,
-	dur int,
-	pic, cover, trackCover string,
-	navidromeID, mbid string,
-	ts int64,
-	source string,
-) bool {
+func commitScrobble(artist, album, track string, dur int, pic, cover, trackCover string, navidromeID, mbid string, ts int64, source string) bool {
 	if db == nil {
 		return false
 	}
-
-	a := strings.TrimSpace(artist)
-	al := strings.TrimSpace(album)
-	tr := strings.TrimSpace(track)
 
 	if source == "" {
 		source = "live"
@@ -223,41 +213,83 @@ func commitScrobble(
 	dbMu.Lock()
 	defer dbMu.Unlock()
 
-	// 1. Upsert artist
+	artistID, ok := upsertArtist(strings.TrimSpace(artist), pic)
+	if !ok {
+		return false
+	}
+
+	albumID, ok := upsertAlbum(artistID, strings.TrimSpace(album), cover, navidromeID)
+	if !ok {
+		return false
+	}
+
+	trackID, ok := upsertTrack(artistID, albumID, strings.TrimSpace(track), dur, trackCover, navidromeID, mbid)
+	if !ok {
+		return false
+	}
+
+	if !insertScrobble(trackID, ts, source) {
+		return false
+	}
+
+	updateMetrics(artistID, albumID, dur, ts)
+	return true
+}
+
+func upsertArtist(name, pic string) (int64, bool) {
 	if _, err := db.Exec(`
 		INSERT INTO artists (name, picture_url, total_plays) VALUES (?, ?, 0)
 		ON CONFLICT(name) DO UPDATE SET
 		picture_url = CASE WHEN ? != '' THEN ? ELSE picture_url END`,
-		a, pic, pic, pic); err != nil {
-		fmt.Printf("commitScrobble: artist insert failed for %q: %v\n", a, err)
-		return false
+		name, pic, pic, pic); err != nil {
+		fmt.Printf("upsertArtist: %q: %v\n", name, err)
+		return 0, false
 	}
-	var artistID int64
-	if err := db.QueryRow(`SELECT rowid FROM artists WHERE name = ?`, a).Scan(&artistID); err != nil {
-		fmt.Printf("commitScrobble: artist lookup failed for %q: %v\n", a, err)
-		return false
+	var id int64
+	if err := db.QueryRow(`SELECT rowid FROM artists WHERE name = ?`, name).Scan(&id); err != nil {
+		fmt.Printf("upsertArtist lookup: %q: %v\n", name, err)
+		return 0, false
+	}
+	return id, true
+}
+
+func upsertAlbum(artistID int64, name, cover, trackNavidromeID string) (sql.NullInt64, bool) {
+	if name == "" {
+		return sql.NullInt64{}, true
 	}
 
-	// 2. Upsert album (nil for singles)
-	var albumID sql.NullInt64
-	if al != "" {
-		if _, err := db.Exec(`
-			INSERT INTO albums (artist_id, name, cover_url, total_plays) VALUES (?, ?, ?, 0)
-			ON CONFLICT(artist_id, name) DO UPDATE SET
-			cover_url = CASE WHEN ? != '' THEN ? ELSE cover_url END`,
-			artistID, al, cover, cover, cover); err != nil {
-			fmt.Printf("commitScrobble: album insert failed for %q/%q: %v\n", a, al, err)
-			return false
+	// new album — fetch cover from Navidrome
+	navAlbumID := ""
+	var existingID int64
+	if err := db.QueryRow(`SELECT rowid FROM albums WHERE artist_id = ? AND name = ? COLLATE NOCASE`, artistID, name).Scan(&existingID); err == sql.ErrNoRows {
+		coverArtID, _ := navidromeGetCoverArt(trackNavidromeID)
+		if coverArtID != "" {
+			cover = navidromeCoverURL(coverArtID)
+			navAlbumID = coverArtID
 		}
-		var id int64
-		if err := db.QueryRow(`SELECT rowid FROM albums WHERE artist_id = ? AND name = ?`, artistID, al).Scan(&id); err != nil {
-			fmt.Printf("commitScrobble: album lookup failed for %q/%q: %v\n", a, al, err)
-			return false
-		}
-		albumID = sql.NullInt64{Int64: id, Valid: true}
 	}
 
-	// 3. Upsert track
+	if _, err := db.Exec(`
+		INSERT INTO albums (artist_id, navidrome_id, name, cover_url, total_plays) VALUES (?, ?, ?, ?, 0)
+		ON CONFLICT(artist_id, name) DO UPDATE SET
+		cover_url    = CASE WHEN ? != '' THEN ? ELSE cover_url END,
+		navidrome_id = CASE WHEN ? != '' THEN ? ELSE navidrome_id END`,
+		artistID, navAlbumID, name, cover,
+		cover, cover,
+		navAlbumID, navAlbumID); err != nil {
+		fmt.Printf("upsertAlbum: %q: %v\n", name, err)
+		return sql.NullInt64{}, false
+	}
+
+	var id int64
+	if err := db.QueryRow(`SELECT rowid FROM albums WHERE artist_id = ? AND name = ?`, artistID, name).Scan(&id); err != nil {
+		fmt.Printf("upsertAlbum lookup: %q: %v\n", name, err)
+		return sql.NullInt64{}, false
+	}
+	return sql.NullInt64{Int64: id, Valid: true}, true
+}
+
+func upsertTrack(artistID int64, albumID sql.NullInt64, name string, dur int, trackCover, navidromeID, mbid string) (int64, bool) {
 	if _, err := db.Exec(`
 		INSERT INTO tracks (artist_id, album_id, navidrome_id, mbid, name, duration, cover_url)
 		VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -267,51 +299,52 @@ func commitScrobble(
 		navidrome_id = CASE WHEN ? != '' THEN ? ELSE navidrome_id END,
 		mbid         = CASE WHEN ? != '' THEN ? ELSE mbid END,
 		cover_url    = CASE WHEN ? != '' THEN ? ELSE cover_url END`,
-		artistID, albumID, navidromeID, mbid, tr, dur, trackCover,
+		artistID, albumID, navidromeID, mbid, name, dur, trackCover,
 		dur, dur,
 		albumID, albumID,
 		navidromeID, navidromeID,
 		mbid, mbid,
 		trackCover, trackCover); err != nil {
-		fmt.Printf("commitScrobble: track insert failed for %q/%q: %v\n", a, tr, err)
-		return false
+		fmt.Printf("upsertTrack: %q: %v\n", name, err)
+		return 0, false
 	}
-	var trackID int64
-	if err := db.QueryRow(`SELECT rowid FROM tracks WHERE artist_id = ? AND name = ?`, artistID, tr).Scan(&trackID); err != nil {
-		fmt.Printf("commitScrobble: track lookup failed for %q/%q: %v\n", a, tr, err)
-		return false
+	var id int64
+	if err := db.QueryRow(`SELECT rowid FROM tracks WHERE artist_id = ? AND name = ?`, artistID, name).Scan(&id); err != nil {
+		fmt.Printf("upsertTrack lookup: %q: %v\n", name, err)
+		return 0, false
 	}
+	return id, true
+}
 
-	// 4. Insert scrobble
+func insertScrobble(trackID, ts int64, source string) bool {
 	res, err := db.Exec(`
 		INSERT OR IGNORE INTO scrobbles (track_id, played_at, source) VALUES (?, ?, ?)`,
 		trackID, ts, source)
 	if err != nil {
-		fmt.Printf("commitScrobble: scrobble insert failed for track_id=%d ts=%d: %v\n", trackID, ts, err)
+		fmt.Printf("insertScrobble: track_id=%d ts=%d: %v\n", trackID, ts, err)
 		return false
 	}
+	rows, _ := res.RowsAffected()
+	return rows > 0
+}
 
-	// 5. Update metrics only if scrobble was new
-	if rows, _ := res.RowsAffected(); rows > 0 {
-		date := time.Unix(ts, 0).Format("2006-01-02")
-		db.Exec(`UPDATE artists SET total_plays = total_plays + 1 WHERE id = ?`, artistID)
-		if albumID.Valid {
-			db.Exec(`UPDATE albums SET total_plays = total_plays + 1 WHERE id = ?`, albumID.Int64)
-		}
-		db.Exec(`
-			UPDATE global_metrics
-			SET total_scrobbles        = total_scrobbles + 1,
-			    total_duration_seconds = total_duration_seconds + ?
-			WHERE id = 1`, dur)
-		db.Exec(`
-			INSERT INTO daily_metrics (date, scrobble_count, duration_seconds) VALUES (?, 1, ?)
-			ON CONFLICT(date) DO UPDATE SET
-			scrobble_count   = scrobble_count + 1,
-			duration_seconds = duration_seconds + ?`,
-			date, dur, dur)
-		return true
+func updateMetrics(artistID int64, albumID sql.NullInt64, dur int, ts int64) {
+	date := time.Unix(ts, 0).Format("2006-01-02")
+	db.Exec(`UPDATE artists SET total_plays = total_plays + 1 WHERE id = ?`, artistID)
+	if albumID.Valid {
+		db.Exec(`UPDATE albums SET total_plays = total_plays + 1 WHERE id = ?`, albumID.Int64)
 	}
-	return false
+	db.Exec(`
+		UPDATE global_metrics
+		SET total_scrobbles        = total_scrobbles + 1,
+		    total_duration_seconds = total_duration_seconds + ?
+		WHERE id = 1`, dur)
+	db.Exec(`
+		INSERT INTO daily_metrics (date, scrobble_count, duration_seconds) VALUES (?, 1, ?)
+		ON CONFLICT(date) DO UPDATE SET
+		scrobble_count   = scrobble_count + 1,
+		duration_seconds = duration_seconds + ?`,
+		date, dur, dur)
 }
 
 // --- scrobble ---
@@ -322,8 +355,6 @@ func handleScrobble(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer r.Body.Close()
-
-	fmt.Printf("[DEBUG] payload: %+v\n", payload)
 
 	ok := commitScrobble(
 		payload.Artist,
@@ -372,4 +403,62 @@ type ScrobblePayload struct {
 	Timestamp   int64   `json:"timestamp"`
 	NavidromeID string  `json:"navidromeId"`
 	MBID        string  `json:"mbid,omitempty"`
+}
+
+type NavidromeTrackResponse struct {
+	SubsonicResponse struct {
+		Song struct {
+			CoverArt string `json:"coverArt"`
+			AlbumID  string `json:"albumId"`
+		} `json:"song"`
+	} `json:"subsonic-response"`
+}
+
+func navidromeGetCoverArt(trackNavidromeID string) (coverArtID string, albumID string) {
+	base := os.Getenv("NAVIDROME_URL")
+	user := os.Getenv("NAVIDROME_USER")
+	pass := os.Getenv("NAVIDROME_PASS")
+
+	if base == "" || user == "" || pass == "" {
+		return "", ""
+	}
+
+	u := fmt.Sprintf("%s/rest/getSong?v=1.16.1&c=my_lastfm&f=json&u=%s&p=%s&id=%s",
+		base,
+		url.QueryEscape(user),
+		url.QueryEscape(pass),
+		url.QueryEscape(trackNavidromeID),
+	)
+
+	resp, err := http.Get(u)
+	if err != nil || resp.StatusCode != 200 {
+		fmt.Printf("[navidrome] getSong failed for %s: %v\n", trackNavidromeID, err)
+		return "", ""
+	}
+	defer resp.Body.Close()
+
+	var result NavidromeTrackResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		fmt.Printf("[navidrome] decode failed: %v\n", err)
+		return "", ""
+	}
+
+	return result.SubsonicResponse.Song.CoverArt, result.SubsonicResponse.Song.AlbumID
+}
+
+func navidromeCoverURL(coverArtID string) string {
+	base := os.Getenv("NAVIDROME_URL")
+	user := os.Getenv("NAVIDROME_USER")
+	pass := os.Getenv("NAVIDROME_PASS")
+
+	if base == "" || coverArtID == "" {
+		return ""
+	}
+
+	return fmt.Sprintf("%s/rest/getCoverArt?v=1.16.1&c=my_lastfm&f=json&u=%s&p=%s&id=%s&size=300",
+		base,
+		url.QueryEscape(user),
+		url.QueryEscape(pass),
+		url.QueryEscape(coverArtID),
+	)
 }
