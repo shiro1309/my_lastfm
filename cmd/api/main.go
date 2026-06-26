@@ -11,6 +11,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	_ "modernc.org/sqlite"
 )
 
 var (
@@ -165,6 +167,7 @@ func initDB() error {
 func initEnv() {
 	f, err := os.Open(".env")
 	if err != nil {
+		fmt.Errorf("No env: %w", err)
 		return
 	}
 	defer f.Close()
