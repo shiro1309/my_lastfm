@@ -43,6 +43,17 @@ func main() {
 		os.Exit(1)
 	}
 
+	navidromeDBPath := os.Getenv("NAVIDROME_DB_PATH")
+	if navidromeDBPath != "" {
+		if err := initBackfill(navidromeDBPath); err != nil {
+			fmt.Printf("warning -- backfill disabled: %v\n", err)
+		} else {
+			fmt.Println("backfill: running...")
+			imported, skipped := runBackfill()
+			fmt.Printf("backfill: %d imported, %d skipped\n", imported, skipped)
+		}
+	}
+
 	var totalScrobbles, totalSecs int64
 	db.QueryRow("SELECT total_scrobbles, total_duration_seconds FROM global_metrics WHERE id=1").
 		Scan(&totalScrobbles, &totalSecs)
@@ -141,15 +152,16 @@ func initDB() error {
 			UNIQUE(artist_id, name)
 		)`,
 		`CREATE TABLE IF NOT EXISTS tracks (
-			id           INTEGER PRIMARY KEY AUTOINCREMENT,
-			artist_id    INTEGER NOT NULL REFERENCES artists(id),
-			album_id     INTEGER REFERENCES albums(id),
-			navidrome_id TEXT DEFAULT '',
-			mbid         TEXT DEFAULT '',
-			name         TEXT NOT NULL COLLATE NOCASE,
-			duration     INTEGER DEFAULT 0,
-			cover_url    TEXT DEFAULT '',
-			UNIQUE(artist_id, name)
+		    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+		    artist_id    INTEGER NOT NULL REFERENCES artists(id),
+		    album_id     INTEGER REFERENCES albums(id),
+		    navidrome_id TEXT DEFAULT '',
+		    mbid         TEXT DEFAULT '',
+		    name         TEXT NOT NULL COLLATE NOCASE,
+		    duration     INTEGER DEFAULT 0,
+		    cover_url    TEXT DEFAULT '',
+		    play_count   INTEGER DEFAULT 0,
+		    UNIQUE(artist_id, name)
 		)`,
 		`CREATE TABLE IF NOT EXISTS scrobbles (
 			id        INTEGER PRIMARY KEY AUTOINCREMENT,
