@@ -21,6 +21,22 @@ var (
 	dbMu sync.Mutex
 )
 
+func logoOutRebel() {
+	fmt.Println(`
+	 ██████   ██████                      ████                     █████       ██████                 
+	▒▒██████ ██████                      ▒▒███                    ▒▒███       ███▒▒███                
+	 ▒███▒█████▒███  █████ ████           ▒███   ██████    █████  ███████    ▒███ ▒▒▒  █████████████  
+	 ▒███▒▒███ ▒███ ▒▒███ ▒███            ▒███  ▒▒▒▒▒███  ███▒▒  ▒▒▒███▒    ███████   ▒▒███▒▒███▒▒███ 
+	 ▒███ ▒▒▒  ▒███  ▒███ ▒███            ▒███   ███████ ▒▒█████   ▒███    ▒▒▒███▒     ▒███ ▒███ ▒███ 
+	 ▒███      ▒███  ▒███ ▒███            ▒███  ███▒▒███  ▒▒▒▒███  ▒███ ███  ▒███      ▒███ ▒███ ▒███ 
+	 █████     █████ ▒▒███████  █████████ █████▒▒████████ ██████   ▒▒█████   █████     █████▒███ █████
+	▒▒▒▒▒     ▒▒▒▒▒   ▒▒▒▒▒███ ▒▒▒▒▒▒▒▒▒ ▒▒▒▒▒  ▒▒▒▒▒▒▒▒ ▒▒▒▒▒▒     ▒▒▒▒▒   ▒▒▒▒▒     ▒▒▒▒▒ ▒▒▒ ▒▒▒▒▒ 
+	                  ███ ▒███                                                         Version: 0.0.1
+	                 ▒▒██████                                                                         
+	                  ▒▒▒▒▒▒                                                                          
+	`)
+}
+
 func main() {
 	initEnv()
 
@@ -47,15 +63,108 @@ func main() {
 	mux.HandleFunc("POST /api/scrobble", handleScrobble)
 
 	fmt.Printf("listening on :%s\n", port)
-	fmt.Printf("  POST /api/scrobble\n")
-
 	if err := http.ListenAndServe(":"+port, mux); err != nil {
 		fmt.Printf("server failed: %v\n", err)
 		os.Exit(1)
 	}
 }
 
-// --- Init ---
+// --- ENV ---
+func initEnv() {
+	f, err := os.Open(".env")
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	s := bufio.NewScanner(f)
+	for s.Scan() {
+		line := strings.TrimSpace(s.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		if k, v, ok := strings.Cut(line, "="); ok {
+			os.Setenv(strings.TrimSpace(k), strings.Trim(strings.TrimSpace(v), `"'`))
+		}
+	}
+}
+
+// --- NAVIDROME ---
+func navCreds() (base, user, pass string) {
+	return os.Getenv("NAVIDROME_URL"),
+		os.Getenv("NAVIDROME_USER"),
+		url.QueryEscape(os.Getenv("NAVIDROME_PASS"))
+}
+
+func navGet(endpoint string, v any) error {
+	base, user, pass := navCreds()
+	if base == "" {
+		return fmt.Errorf("NAVIDROME_URL not set")
+	}
+	u := fmt.Sprintf("%s/rest/%s&u=%s&p=%s&v=1.16.1&c=my_lastfm&f=json",
+		base, endpoint, user, pass)
+	resp, err := http.Get(u)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	return json.NewDecoder(resp.Body).Decode(v)
+}
+
+type songResponse struct {
+	SubsonicResponse struct {
+		Song struct {
+			CoverArt string `json:"coverArt"`
+			AlbumID  string `json:"albumId"`
+			ArtistID string `json:"artistId"`
+		} `json:"song"`
+	} `json:"subsonic-response"`
+}
+
+type albumResponse struct {
+	SubsonicResponse struct {
+		Album struct {
+			SongCount int    `json:"songCount"`
+			CoverArt  string `json:"coverArt"`
+		} `json:"album"`
+	} `json:"subsonic-response"`
+}
+
+type artistInfoResponse struct {
+	SubsonicResponse struct {
+		ArtistInfo2 struct {
+			LargeImageUrl string `json:"largeImageUrl"`
+		} `json:"artistInfo2"`
+	} `json:"subsonic-response"`
+}
+
+func navidromeGetSong(id string) (coverArtID, albumID, artistID string) {
+	var r songResponse
+	if err := navGet("getSong?id="+url.QueryEscape(id), &r); err != nil {
+		return "", "", ""
+	}
+	s := r.SubsonicResponse.Song
+	return s.CoverArt, s.AlbumID, s.ArtistID
+}
+
+func navidromeGetAlbum(id string) (songCount int, coverArtID string) {
+	var r albumResponse
+	if err := navGet("getAlbum?id="+url.QueryEscape(id), &r); err != nil {
+		return 0, ""
+	}
+	a := r.SubsonicResponse.Album
+	return a.SongCount, a.CoverArt
+}
+
+func navidromeGetArtistImage(id string) string {
+	var r artistInfoResponse
+	if err := navGet("getArtistInfo2?id="+url.QueryEscape(id), &r); err != nil {
+		return ""
+	}
+	return r.SubsonicResponse.ArtistInfo2.LargeImageUrl
+}
+
+// --- DB ---
+
 func initDB() error {
 	var err error
 	dbPath := os.Getenv("DB_PATH")
@@ -78,23 +187,13 @@ func initDB() error {
 	}()
 
 	db.SetMaxOpenConns(1)
-
 	if err = db.Ping(); err != nil {
 		return fmt.Errorf("connect: %w", err)
 	}
 
-	var walMode string
-	if err = db.QueryRow(`PRAGMA journal_mode=WAL`).Scan(&walMode); err != nil {
-		return fmt.Errorf("pragma journal_mode: %w", err)
-	}
-	if walMode != "wal" {
-		return fmt.Errorf("pragma journal_mode: expected wal, got %q", walMode)
-	}
-
 	for _, p := range []struct{ label, sql string }{
-		{"synchronous", `PRAGMA synchronous=NORMAL`},
 		{"foreign_keys", `PRAGMA foreign_keys=ON`},
-		{"wal_autocheckpoint", `PRAGMA wal_autocheckpoint=10`},
+		{"synchronous", `PRAGMA synchronous=NORMAL`},
 	} {
 		if _, err = db.Exec(p.sql); err != nil {
 			return fmt.Errorf("pragma %s: %w", p.label, err)
@@ -166,50 +265,18 @@ func initDB() error {
 	return nil
 }
 
-func initEnv() {
-	f, err := os.Open(".env")
-	if err != nil {
-		fmt.Errorf("No env: %w", err)
-		return
-	}
-	defer f.Close()
-	s := bufio.NewScanner(f)
-	for s.Scan() {
-		line := strings.TrimSpace(s.Text())
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-		if k, v, ok := strings.Cut(line, "="); ok {
-			os.Setenv(strings.TrimSpace(k), strings.Trim(strings.TrimSpace(v), `"'`))
-		}
-	}
-}
+// --- SCROBBLE PIPELINE ---
 
-func logoOutRebel() {
-	fmt.Println(`
-	 ██████   ██████                      ████                     █████       ██████                 
-	▒▒██████ ██████                      ▒▒███                    ▒▒███       ███▒▒███                
-	 ▒███▒█████▒███  █████ ████           ▒███   ██████    █████  ███████    ▒███ ▒▒▒  █████████████  
-	 ▒███▒▒███ ▒███ ▒▒███ ▒███            ▒███  ▒▒▒▒▒███  ███▒▒  ▒▒▒███▒    ███████   ▒▒███▒▒███▒▒███ 
-	 ▒███ ▒▒▒  ▒███  ▒███ ▒███            ▒███   ███████ ▒▒█████   ▒███    ▒▒▒███▒     ▒███ ▒███ ▒███ 
-	 ▒███      ▒███  ▒███ ▒███            ▒███  ███▒▒███  ▒▒▒▒███  ▒███ ███  ▒███      ▒███ ▒███ ▒███ 
-	 █████     █████ ▒▒███████  █████████ █████▒▒████████ ██████   ▒▒█████   █████     █████▒███ █████
-	▒▒▒▒▒     ▒▒▒▒▒   ▒▒▒▒▒███ ▒▒▒▒▒▒▒▒▒ ▒▒▒▒▒  ▒▒▒▒▒▒▒▒ ▒▒▒▒▒▒     ▒▒▒▒▒   ▒▒▒▒▒     ▒▒▒▒▒ ▒▒▒ ▒▒▒▒▒ 
-	                  ███ ▒███                                                         Version: 0.0.1
-	                 ▒▒██████                                                                         
-	                  ▒▒▒▒▒▒                                                                          
-	`)
-}
-
-// --- DB ---
-func commitScrobble(artist, album, track string, dur int, pic, cover, trackCover string, navidromeID, mbid string, ts int64, source string) bool {
+func commitScrobble(artist, album, track string, dur int, navidromeID, mbid string, ts int64, source string) bool {
 	if db == nil {
 		return false
 	}
-
 	if source == "" {
 		source = "live"
 	}
+
+	coverArtID, navAlbumID, navArtistID := navidromeGetSong(navidromeID)
+	pic := navidromeGetArtistImage(navArtistID)
 
 	dbMu.Lock()
 	defer dbMu.Unlock()
@@ -219,7 +286,7 @@ func commitScrobble(artist, album, track string, dur int, pic, cover, trackCover
 		return false
 	}
 
-	albumID, trackCover, ok := upsertAlbum(artistID, strings.TrimSpace(album), cover, navidromeID)
+	albumID, trackCover, ok := upsertAlbum(artistID, strings.TrimSpace(album), coverArtID, navAlbumID)
 	if !ok {
 		return false
 	}
@@ -254,9 +321,7 @@ func upsertArtist(name, pic string) (int64, bool) {
 	return id, true
 }
 
-func upsertAlbum(artistID int64, name, cover, trackNavidromeID string) (sql.NullInt64, string, bool) {
-	// returns albumID, trackCover, ok
-	// trackCover is non-empty when it's a single — caller sets it on the track instead
+func upsertAlbum(artistID int64, name, coverArtID, navAlbumID string) (sql.NullInt64, string, bool) {
 	if name == "" {
 		return sql.NullInt64{}, "", true
 	}
@@ -265,19 +330,10 @@ func upsertAlbum(artistID int64, name, cover, trackNavidromeID string) (sql.Null
 	err := db.QueryRow(`SELECT rowid FROM albums WHERE artist_id = ? AND name = ? COLLATE NOCASE`, artistID, name).Scan(&existingID)
 
 	if err == sql.ErrNoRows {
-		// new — fetch from Navidrome
-		coverArtID, navAlbumID := navidromeGetCoverArt(trackNavidromeID)
 		songCount, _ := navidromeGetAlbum(navAlbumID)
-
 		if songCount > 0 && songCount < 3 {
-			// it's a single — don't create album row, put cover on track
 			fmt.Printf("[upsertAlbum] %q has %d tracks — treating as single\n", name, songCount)
 			return sql.NullInt64{}, coverArtID, true
-		}
-
-		// real album — upsert it
-		if coverArtID != "" {
-			cover = coverArtID
 		}
 
 		if _, err := db.Exec(`
@@ -285,8 +341,8 @@ func upsertAlbum(artistID int64, name, cover, trackNavidromeID string) (sql.Null
 			ON CONFLICT(artist_id, name) DO UPDATE SET
 			cover_url    = CASE WHEN ? != '' THEN ? ELSE cover_url END,
 			navidrome_id = CASE WHEN ? != '' THEN ? ELSE navidrome_id END`,
-			artistID, navAlbumID, name, cover,
-			cover, cover,
+			artistID, navAlbumID, name, coverArtID,
+			coverArtID, coverArtID,
 			navAlbumID, navAlbumID); err != nil {
 			fmt.Printf("upsertAlbum: %q: %v\n", name, err)
 			return sql.NullInt64{}, "", false
@@ -359,7 +415,8 @@ func updateMetrics(artistID int64, albumID sql.NullInt64, dur int, ts int64) {
 		date, dur, dur)
 }
 
-// --- scrobble ---
+// --- HTTP ---
+
 func handleScrobble(w http.ResponseWriter, r *http.Request) {
 	var payload schema.ScrobblePayload
 	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
@@ -369,15 +426,10 @@ func handleScrobble(w http.ResponseWriter, r *http.Request) {
 	defer r.Body.Close()
 
 	ok := commitScrobble(
-		payload.Artist,
-		payload.Album,
-		payload.Title,
+		payload.Artist, payload.Album, payload.Title,
 		int(payload.Duration),
-		"", "", "",
-		payload.NavidromeID,
-		payload.MBID,
-		payload.Timestamp,
-		"live",
+		payload.NavidromeID, payload.MBID,
+		payload.Timestamp, "live",
 	)
 
 	if ok {
@@ -390,7 +442,6 @@ func handleScrobble(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// --- utils ---
 func jsonOK(w http.ResponseWriter, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(v)
@@ -403,113 +454,4 @@ func jsonError(w http.ResponseWriter, msg string, code int, err error) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
 	json.NewEncoder(w).Encode(map[string]string{"error": msg})
-}
-
-type ScrobblePayload struct {
-	Title       string  `json:"title"`
-	Artist      string  `json:"artist"`
-	Album       string  `json:"album"`
-	Duration    float32 `json:"duration"`
-	TrackNumber int32   `json:"trackNumber"`
-	DiscNumber  int32   `json:"discNumber"`
-	Timestamp   int64   `json:"timestamp"`
-	NavidromeID string  `json:"navidromeId"`
-	MBID        string  `json:"mbid,omitempty"`
-}
-
-type NavidromeTrackResponse struct {
-	SubsonicResponse struct {
-		Song struct {
-			CoverArt string `json:"coverArt"`
-			AlbumID  string `json:"albumId"`
-		} `json:"song"`
-	} `json:"subsonic-response"`
-}
-
-func navidromeGetCoverArt(trackNavidromeID string) (coverArtID string, albumID string) {
-	base := os.Getenv("NAVIDROME_URL")
-	user := os.Getenv("NAVIDROME_USER")
-	pass := os.Getenv("NAVIDROME_PASS")
-
-	if base == "" || user == "" || pass == "" {
-		return "", ""
-	}
-
-	u := fmt.Sprintf("%s/rest/getSong?v=1.16.1&c=my_lastfm&f=json&u=%s&p=%s&id=%s",
-		base,
-		url.QueryEscape(user),
-		url.QueryEscape(pass),
-		url.QueryEscape(trackNavidromeID),
-	)
-
-	resp, err := http.Get(u)
-	if err != nil || resp.StatusCode != 200 {
-		fmt.Printf("[navidrome] getSong failed for %s: %v\n", trackNavidromeID, err)
-		return "", ""
-	}
-	defer resp.Body.Close()
-
-	var result NavidromeTrackResponse
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		fmt.Printf("[navidrome] decode failed: %v\n", err)
-		return "", ""
-	}
-
-	return result.SubsonicResponse.Song.CoverArt, result.SubsonicResponse.Song.AlbumID
-}
-
-func navidromeCoverURL(coverArtID string) string {
-	base := os.Getenv("NAVIDROME_URL")
-	user := os.Getenv("NAVIDROME_USER")
-	pass := os.Getenv("NAVIDROME_PASS")
-
-	if base == "" || coverArtID == "" {
-		return ""
-	}
-
-	return fmt.Sprintf("%s/rest/getCoverArt?v=1.16.1&c=my_lastfm&f=json&u=%s&p=%s&id=%s&size=300",
-		base,
-		url.QueryEscape(user),
-		url.QueryEscape(pass),
-		url.QueryEscape(coverArtID),
-	)
-}
-
-type NavidromeAlbumResponse struct {
-	SubsonicResponse struct {
-		Album struct {
-			SongCount int    `json:"songCount"`
-			CoverArt  string `json:"coverArt"`
-		} `json:"album"`
-	} `json:"subsonic-response"`
-}
-
-func navidromeGetAlbum(albumID string) (songCount int, coverArtID string) {
-	base := os.Getenv("NAVIDROME_URL")
-	user := os.Getenv("NAVIDROME_USER")
-	pass := os.Getenv("NAVIDROME_PASS")
-
-	if base == "" || albumID == "" {
-		return 0, ""
-	}
-
-	u := fmt.Sprintf("%s/rest/getAlbum?v=1.16.1&c=my_lastfm&f=json&u=%s&p=%s&id=%s",
-		base,
-		url.QueryEscape(user),
-		url.QueryEscape(pass),
-		url.QueryEscape(albumID),
-	)
-
-	resp, err := http.Get(u)
-	if err != nil || resp.StatusCode != 200 {
-		return 0, ""
-	}
-	defer resp.Body.Close()
-
-	var result NavidromeAlbumResponse
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return 0, ""
-	}
-
-	return result.SubsonicResponse.Album.SongCount, result.SubsonicResponse.Album.CoverArt
 }
